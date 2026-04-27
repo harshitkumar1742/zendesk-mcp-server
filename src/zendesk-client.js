@@ -70,6 +70,27 @@ import axios from 'axios';
         return this.request('DELETE', `/tickets/${id}.json`);
       }
 
+      async getTicketComments(id, params = {}) {
+        return this.request('GET', `/tickets/${id}/comments.json`, null, params);
+      }
+
+      async downloadAttachment(contentUrl) {
+        // content_url is an absolute URL to download the file binary.
+        // Same Basic auth applies. Return raw bytes as a Buffer.
+        if (!this.subdomain || !this.email || !this.apiToken) {
+          throw new Error('Zendesk credentials not configured.');
+        }
+        const response = await axios({
+          method: 'GET',
+          url: contentUrl,
+          headers: { 'Authorization': this.getAuthHeader() },
+          responseType: 'arraybuffer',
+          maxContentLength: 100 * 1024 * 1024, // 100 MB hard ceiling
+          maxBodyLength: 100 * 1024 * 1024,
+        });
+        return Buffer.from(response.data);
+      }
+
       // Users
       async listUsers(params) {
         return this.request('GET', '/users.json', null, params);
