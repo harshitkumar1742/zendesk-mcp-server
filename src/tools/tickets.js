@@ -162,23 +162,26 @@ import { z } from 'zod';
       },
       {
         name: "get_ticket_with_thread",
-        description: "Get a ticket with its comment thread and all attachments rendered in formats Claude can use directly (images as image content, PDFs/Word/Excel/CSV/text extracted to text). Use this instead of get_ticket when scoping or investigating a ticket — get_ticket alone returns description + metadata only and does not include the comment thread.\n\nFor long tickets (many comments / large attachments), set `mode` to control response size:\n- 'full' (default) — every comment + attachment. Auto-falls back to 'head_tail' if total text exceeds max_total_chars.\n- 'head_tail' — first head_count + last tail_count comments (default 10 each), plus every internal note. Middle replaced by a placeholder noting omitted count + timestamp range.\n- 'summary' — header + counts + first comment + last 3 comments + every internal note. Smallest mode; use when only orientation is needed.\n- 'range' — slice [comment_start, comment_end] (0-indexed, inclusive). Use after an initial 'summary'/'head_tail' call when you need a specific stretch of the middle.",
+        description: "Get a ticket with its full comment thread (every page is fetched; the header and footer state complete: true/false) and, when include_attachments=true, attachments rendered in formats Claude can use directly (images as image content, PDFs/Word/Excel/CSV/text extracted to text). Use this instead of get_ticket when scoping or investigating a ticket — get_ticket alone returns description + metadata only and does not include the comment thread.\n\nFor long tickets (many comments / large attachments), set `mode` to control response size:\n- 'full' (default) — every comment + attachment. Auto-falls back to 'head_tail' if total text exceeds max_total_chars.\n- 'head_tail' — first head_count + last tail_count comments (default 10 each), plus every internal note. Middle replaced by a placeholder noting omitted count + timestamp range.\n- 'summary' — header + counts + first comment + last 3 comments + every internal note. Smallest mode; use when only orientation is needed.\n- 'range' — slice [comment_start, comment_end] (0-indexed, inclusive). Use after an initial 'summary'/'head_tail' call when you need a specific stretch of the middle.",
         schema: {
           id: z.number().describe("Ticket ID"),
-          include_attachments: z.boolean().optional().default(true).describe("If false, attachment metadata is included but binaries are not fetched. Default true."),
+          include_attachments: z.boolean().optional().default(false).describe("If true, attachment contents are fetched and inlined (within the max_total_chars budget). Default false: attachment metadata + URL only, so attachments can never crowd out comments."),
           max_attachment_mb: z.number().optional().default(20).describe("Skip any single attachment larger than this many megabytes; surface its URL only. Default 20."),
           mode: z.enum(["full", "head_tail", "summary", "range"]).optional().default("full").describe("Thread rendering mode. See tool description for behavior. Default 'full'."),
-          max_total_chars: z.number().optional().default(400_000).describe("Soft cap on total comment-body characters for mode='full'. If exceeded, auto-falls back to 'head_tail' and includes a notice. Default 400000."),
+          max_total_chars: z.number().optional().default(80_000).describe("Response budget in characters. Comment bodies over this in mode='full' auto-fall back to 'head_tail' with a notice; inlined attachment text/images also count, and attachments past the budget are listed as metadata + URL. Default 80000 (keeps results under the client's tool-output limit)."),
           head_count: z.number().optional().default(10).describe("For mode='head_tail': number of leading comments to include. Default 10."),
           tail_count: z.number().optional().default(10).describe("For mode='head_tail': number of trailing comments to include. Default 10."),
           comment_start: z.number().optional().describe("For mode='range': 0-indexed first comment to include (inclusive)."),
           comment_end: z.number().optional().describe("For mode='range': 0-indexed last comment to include (inclusive).")
         },
-        handler: async ({ id, include_attachments = true, max_attachment_mb = 20, mode = "full", max_total_chars = 400_000, head_count = 10, tail_count = 10, comment_start, comment_end }) => {
+        handler: async ({ id, include_attachments = false, max_attachment_mb = 20, mode = "full", max_total_chars = 80_000, head_count = 10, tail_count = 10, comment_start, comment_end }) => {
           // Helper: render one attachment into one or more MCP content blocks.
           // Returns an array of content blocks (text and/or image).
-          const MAX_TEXT_CHARS = 200_000; // 200 KB cap on extracted text per attachment
+          const MAX_TEXT_CHARS_PER_ATTACHMENT = 200_000; // 200 KB cap on extracted text per attachment
           const sizeLimitBytes = max_attachment_mb * 1024 * 1024;
+
+          // Characters already emitted; inlined attachments draw from the same budget.
+          let charsUsed = 0;
 
           const renderAttachment = async (att) => {
             const meta = `[${att.file_name || 'attachment'} | ${att.content_type || 'unknown type'} | ${att.size != null ? att.size + ' bytes' : 'size unknown'}]`;
@@ -186,6 +189,11 @@ import { z } from 'zod';
             if (!include_attachments) {
               return [{ type: 'text', text: `Attachment ${meta}\n  URL: ${att.content_url}\n  (binary not fetched: include_attachments=false)` }];
             }
+            if (charsUsed >= max_total_chars) {
+              return [{ type: 'text', text: `Attachment ${meta}\n  URL: ${att.content_url}\n  (not inlined: response budget max_total_chars=${max_total_chars} reached)` }];
+            }
+            // Extracted text from this attachment may use only what is left of the budget.
+            const MAX_TEXT_CHARS = Math.min(MAX_TEXT_CHARS_PER_ATTACHMENT, max_total_chars - charsUsed);
             if (att.size != null && att.size > sizeLimitBytes) {
               return [{ type: 'text', text: `Attachment ${meta}\n  URL: ${att.content_url}\n  (skipped: exceeds max_attachment_mb=${max_attachment_mb})` }];
             }
@@ -201,6 +209,9 @@ import { z } from 'zod';
 
             // Images → MCP image block
             if (ct.startsWith('image/')) {
+              if (Math.ceil(buf.length / 3) * 4 > max_total_chars - charsUsed) {
+                return [{ type: 'text', text: `Attachment ${meta}\n  URL: ${att.content_url}\n  (image not inlined: larger than the remaining response budget)` }];
+              }
               return [
                 { type: 'text', text: `Attachment ${meta}` },
                 { type: 'image', data: buf.toString('base64'), mimeType: att.content_type }
@@ -282,10 +293,12 @@ import { z } from 'zod';
 
           try {
             const ticketResp = await zendeskClient.getTicket(id);
-            const commentsResp = await zendeskClient.getTicketComments(id);
+            const { comments, pages, complete } = await zendeskClient.getAllTicketComments(id);
             const ticket = ticketResp.ticket || ticketResp;
-            const comments = commentsResp.comments || [];
             const total = comments.length;
+            const completeness = complete
+              ? `all ${total} comments fetched across ${pages} page(s), complete: true`
+              : `INCOMPLETE: only the first ${total} comments were fetched (${pages} pages, safety cap reached), complete: false`;
 
             // Decide which comment indices to include based on mode.
             // selectedIndices = ordered list of indices to render. gapNotes = map of index -> gap notice to insert *before* it.
@@ -377,8 +390,12 @@ import { z } from 'zod';
 
             blocks.push({
               type: 'text',
-              text: `# Ticket #${ticket.id} — ${ticket.subject || '(no subject)'}\nStatus: ${ticket.status} | Priority: ${ticket.priority} | Type: ${ticket.type || 'n/a'}\nCreated: ${ticket.created_at} | Updated: ${ticket.updated_at}\nRequester ID: ${ticket.requester_id} | Assignee ID: ${ticket.assignee_id} | Org ID: ${ticket.organization_id}\nTags: ${(ticket.tags || []).join(', ')}\n\n## Description\n${ticket.description || '(empty)'}\n\n## Comment thread (${total} comments total, ${selectedIndices.length} included, ${modeNotice})`
+              text: `# Ticket #${ticket.id} — ${ticket.subject || '(no subject)'}\nStatus: ${ticket.status} | Priority: ${ticket.priority} | Type: ${ticket.type || 'n/a'}\nCreated: ${ticket.created_at} | Updated: ${ticket.updated_at}\nRequester ID: ${ticket.requester_id} | Assignee ID: ${ticket.assignee_id} | Org ID: ${ticket.organization_id}\nTags: ${(ticket.tags || []).join(', ')}\n\n## Description\n${ticket.description || '(empty)'}\n\n## Comment thread (${completeness}; ${selectedIndices.length} included, ${modeNotice})`
             });
+            if (!complete) {
+              blocks.push({ type: 'text', text: `⚠ INCOMPLETE THREAD: later comments were not fetched. Do not treat the last comment shown as the latest.` });
+            }
+            charsUsed = blocks.reduce((acc, b) => acc + (b.text ? b.text.length : 0), 0);
 
             for (const i of selectedIndices) {
               if (gapNotes[i]) {
@@ -386,19 +403,22 @@ import { z } from 'zod';
               }
               const c = comments[i];
               const visibility = c.public === false ? 'INTERNAL NOTE' : 'public';
-              blocks.push({
-                type: 'text',
-                text: `\n--- Comment ${i + 1}/${total} (${visibility}) by author_id=${c.author_id} on ${c.created_at} ---\n${c.body || ''}`
-              });
+              const commentText = `\n--- Comment ${i + 1}/${total} (${visibility}) by author_id=${c.author_id} on ${c.created_at} ---\n${c.body || ''}`;
+              blocks.push({ type: 'text', text: commentText });
+              charsUsed += commentText.length;
               const atts = c.attachments || [];
               for (const att of atts) {
                 const rendered = await renderAttachment(att);
-                for (const block of rendered) blocks.push(block);
+                for (const block of rendered) {
+                  blocks.push(block);
+                  charsUsed += block.type === 'image' ? (block.data || '').length : (block.text || '').length;
+                }
               }
             }
             if (gapNotes['__trailing__']) {
               blocks.push({ type: 'text', text: gapNotes['__trailing__'] });
             }
+            blocks.push({ type: 'text', text: `\n## End of thread (${completeness})` });
 
             return { content: blocks };
           } catch (error) {

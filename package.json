@@ -10,7 +10,8 @@
       "scripts": {
             "start": "node src/index.js",
             "dev": "node --watch src/index.js",
-            "inspect": "npx -y @modelcontextprotocol/inspector node src/index.js"
+            "inspect": "npx -y @modelcontextprotocol/inspector node src/index.js",
+            "test": "node test/get_ticket_with_thread.test.mjs"
       },
       "dependencies": {
             "@modelcontextprotocol/sdk": "^1.0.0",
