@@ -162,13 +162,19 @@ import { z } from 'zod';
       },
       {
         name: "get_ticket_with_thread",
-        description: "Get a ticket with its full comment thread and all attachments rendered in formats Claude can use directly (images as image content, PDFs/Word/Excel/CSV/text extracted to text). Use this instead of get_ticket when scoping or investigating a ticket — get_ticket alone returns description + metadata only and does not include the comment thread.",
+        description: "Get a ticket with its comment thread and all attachments rendered in formats Claude can use directly (images as image content, PDFs/Word/Excel/CSV/text extracted to text). Use this instead of get_ticket when scoping or investigating a ticket — get_ticket alone returns description + metadata only and does not include the comment thread.\n\nFor long tickets (many comments / large attachments), set `mode` to control response size:\n- 'full' (default) — every comment + attachment. Auto-falls back to 'head_tail' if total text exceeds max_total_chars.\n- 'head_tail' — first head_count + last tail_count comments (default 10 each), plus every internal note. Middle replaced by a placeholder noting omitted count + timestamp range.\n- 'summary' — header + counts + first comment + last 3 comments + every internal note. Smallest mode; use when only orientation is needed.\n- 'range' — slice [comment_start, comment_end] (0-indexed, inclusive). Use after an initial 'summary'/'head_tail' call when you need a specific stretch of the middle.",
         schema: {
           id: z.number().describe("Ticket ID"),
           include_attachments: z.boolean().optional().default(true).describe("If false, attachment metadata is included but binaries are not fetched. Default true."),
-          max_attachment_mb: z.number().optional().default(20).describe("Skip any single attachment larger than this many megabytes; surface its URL only. Default 20.")
+          max_attachment_mb: z.number().optional().default(20).describe("Skip any single attachment larger than this many megabytes; surface its URL only. Default 20."),
+          mode: z.enum(["full", "head_tail", "summary", "range"]).optional().default("full").describe("Thread rendering mode. See tool description for behavior. Default 'full'."),
+          max_total_chars: z.number().optional().default(400_000).describe("Soft cap on total comment-body characters for mode='full'. If exceeded, auto-falls back to 'head_tail' and includes a notice. Default 400000."),
+          head_count: z.number().optional().default(10).describe("For mode='head_tail': number of leading comments to include. Default 10."),
+          tail_count: z.number().optional().default(10).describe("For mode='head_tail': number of trailing comments to include. Default 10."),
+          comment_start: z.number().optional().describe("For mode='range': 0-indexed first comment to include (inclusive)."),
+          comment_end: z.number().optional().describe("For mode='range': 0-indexed last comment to include (inclusive).")
         },
-        handler: async ({ id, include_attachments = true, max_attachment_mb = 20 }) => {
+        handler: async ({ id, include_attachments = true, max_attachment_mb = 20, mode = "full", max_total_chars = 400_000, head_count = 10, tail_count = 10, comment_start, comment_end }) => {
           // Helper: render one attachment into one or more MCP content blocks.
           // Returns an array of content blocks (text and/or image).
           const MAX_TEXT_CHARS = 200_000; // 200 KB cap on extracted text per attachment
@@ -279,25 +285,119 @@ import { z } from 'zod';
             const commentsResp = await zendeskClient.getTicketComments(id);
             const ticket = ticketResp.ticket || ticketResp;
             const comments = commentsResp.comments || [];
+            const total = comments.length;
+
+            // Decide which comment indices to include based on mode.
+            // selectedIndices = ordered list of indices to render. gapNotes = map of index -> gap notice to insert *before* it.
+            let effectiveMode = mode;
+            let selectedIndices = [];
+            const gapNotes = {};
+
+            const internalNoteIndices = comments
+              .map((c, i) => (c.public === false ? i : -1))
+              .filter(i => i !== -1);
+
+            const buildGapNote = (omittedIndices) => {
+              if (omittedIndices.length === 0) return null;
+              const firstIdx = omittedIndices[0];
+              const lastIdx = omittedIndices[omittedIndices.length - 1];
+              const firstTs = comments[firstIdx]?.created_at || '?';
+              const lastTs = comments[lastIdx]?.created_at || '?';
+              return `\n[… ${omittedIndices.length} comment(s) omitted, indices ${firstIdx}–${lastIdx}, ${firstTs} → ${lastTs}. Re-call with mode='range', comment_start=${firstIdx}, comment_end=${lastIdx} to inspect …]\n`;
+            };
+
+            // For mode='full', pre-compute total comment-body chars and auto-fallback if too large.
+            if (effectiveMode === 'full') {
+              const totalChars = comments.reduce((acc, c) => acc + ((c.body || '').length), 0);
+              if (totalChars > max_total_chars) {
+                effectiveMode = 'head_tail';
+              }
+            }
+
+            if (effectiveMode === 'full') {
+              selectedIndices = comments.map((_, i) => i);
+            } else if (effectiveMode === 'head_tail') {
+              const headEnd = Math.min(head_count, total);
+              const tailStart = Math.max(total - tail_count, headEnd);
+              const head = Array.from({ length: headEnd }, (_, i) => i);
+              const tail = Array.from({ length: total - tailStart }, (_, i) => tailStart + i);
+              // Always include every internal note even if it fell in the middle.
+              const set = new Set([...head, ...tail, ...internalNoteIndices]);
+              selectedIndices = [...set].sort((a, b) => a - b);
+            } else if (effectiveMode === 'summary') {
+              const summaryIndices = new Set();
+              if (total > 0) summaryIndices.add(0);
+              for (let i = Math.max(0, total - 3); i < total; i++) summaryIndices.add(i);
+              internalNoteIndices.forEach(i => summaryIndices.add(i));
+              selectedIndices = [...summaryIndices].sort((a, b) => a - b);
+            } else if (effectiveMode === 'range') {
+              if (comment_start == null || comment_end == null) {
+                return {
+                  content: [{ type: 'text', text: `Error: mode='range' requires both comment_start and comment_end.` }],
+                  isError: true
+                };
+              }
+              const start = Math.max(0, comment_start);
+              const end = Math.min(total - 1, comment_end);
+              if (start > end) {
+                return {
+                  content: [{ type: 'text', text: `Error: comment_start (${comment_start}) > comment_end (${comment_end}) after clamping to [0, ${total - 1}].` }],
+                  isError: true
+                };
+              }
+              selectedIndices = Array.from({ length: end - start + 1 }, (_, i) => start + i);
+            }
+
+            // Build gap notes between consecutive non-adjacent selected indices.
+            for (let k = 0; k < selectedIndices.length; k++) {
+              const idx = selectedIndices[k];
+              const prev = k === 0 ? -1 : selectedIndices[k - 1];
+              if (idx - prev > 1) {
+                const omitted = [];
+                for (let j = prev + 1; j < idx; j++) omitted.push(j);
+                const note = buildGapNote(omitted);
+                if (note) gapNotes[idx] = (gapNotes[idx] || '') + note;
+              }
+            }
+            // Trailing gap (after last selected index).
+            if (selectedIndices.length > 0) {
+              const last = selectedIndices[selectedIndices.length - 1];
+              if (last < total - 1) {
+                const omitted = [];
+                for (let j = last + 1; j < total; j++) omitted.push(j);
+                const note = buildGapNote(omitted);
+                if (note) gapNotes['__trailing__'] = note;
+              }
+            }
 
             const blocks = [];
+            const modeNotice = effectiveMode === mode
+              ? `mode='${effectiveMode}'`
+              : `mode='${effectiveMode}' (auto-fallback from '${mode}': total comment text exceeded max_total_chars=${max_total_chars})`;
+
             blocks.push({
               type: 'text',
-              text: `# Ticket #${ticket.id} — ${ticket.subject || '(no subject)'}\nStatus: ${ticket.status} | Priority: ${ticket.priority} | Type: ${ticket.type || 'n/a'}\nCreated: ${ticket.created_at} | Updated: ${ticket.updated_at}\nRequester ID: ${ticket.requester_id} | Assignee ID: ${ticket.assignee_id} | Org ID: ${ticket.organization_id}\nTags: ${(ticket.tags || []).join(', ')}\n\n## Description\n${ticket.description || '(empty)'}\n\n## Comment thread (${comments.length} comments)`
+              text: `# Ticket #${ticket.id} — ${ticket.subject || '(no subject)'}\nStatus: ${ticket.status} | Priority: ${ticket.priority} | Type: ${ticket.type || 'n/a'}\nCreated: ${ticket.created_at} | Updated: ${ticket.updated_at}\nRequester ID: ${ticket.requester_id} | Assignee ID: ${ticket.assignee_id} | Org ID: ${ticket.organization_id}\nTags: ${(ticket.tags || []).join(', ')}\n\n## Description\n${ticket.description || '(empty)'}\n\n## Comment thread (${total} comments total, ${selectedIndices.length} included, ${modeNotice})`
             });
 
-            for (let i = 0; i < comments.length; i++) {
+            for (const i of selectedIndices) {
+              if (gapNotes[i]) {
+                blocks.push({ type: 'text', text: gapNotes[i] });
+              }
               const c = comments[i];
               const visibility = c.public === false ? 'INTERNAL NOTE' : 'public';
               blocks.push({
                 type: 'text',
-                text: `\n--- Comment ${i + 1}/${comments.length} (${visibility}) by author_id=${c.author_id} on ${c.created_at} ---\n${c.body || ''}`
+                text: `\n--- Comment ${i + 1}/${total} (${visibility}) by author_id=${c.author_id} on ${c.created_at} ---\n${c.body || ''}`
               });
               const atts = c.attachments || [];
               for (const att of atts) {
                 const rendered = await renderAttachment(att);
                 for (const block of rendered) blocks.push(block);
               }
+            }
+            if (gapNotes['__trailing__']) {
+              blocks.push({ type: 'text', text: gapNotes['__trailing__'] });
             }
 
             return { content: blocks };
