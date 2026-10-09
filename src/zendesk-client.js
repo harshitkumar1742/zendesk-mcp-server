@@ -70,6 +70,48 @@ import axios from 'axios';
         return this.request('DELETE', `/tickets/${id}.json`);
       }
 
+      async getTicketComments(id, params = {}) {
+        return this.request('GET', `/tickets/${id}/comments.json`, null, params);
+      }
+
+      // Fetch every comment on a ticket using cursor pagination (Zendesk returns
+      // at most 100 per page). Stops at maxPages as a safety cap and reports
+      // whether the thread is complete.
+      async getAllTicketComments(id, { maxPages = 50 } = {}) {
+        const comments = [];
+        let pages = 0;
+        let cursor = null;
+        let hasMore = true;
+        while (hasMore && pages < maxPages) {
+          const params = { 'page[size]': 100 };
+          if (cursor) params['page[after]'] = cursor;
+          const resp = await this.request('GET', `/tickets/${id}/comments.json`, null, params);
+          comments.push(...(resp.comments || []));
+          pages += 1;
+          hasMore = Boolean(resp.meta && resp.meta.has_more);
+          cursor = resp.meta ? resp.meta.after_cursor : null;
+          if (hasMore && !cursor) break;
+        }
+        return { comments, pages, complete: !hasMore };
+      }
+
+      async downloadAttachment(contentUrl) {
+        // content_url is an absolute URL to download the file binary.
+        // Same Basic auth applies. Return raw bytes as a Buffer.
+        if (!this.subdomain || !this.email || !this.apiToken) {
+          throw new Error('Zendesk credentials not configured.');
+        }
+        const response = await axios({
+          method: 'GET',
+          url: contentUrl,
+          headers: { 'Authorization': this.getAuthHeader() },
+          responseType: 'arraybuffer',
+          maxContentLength: 100 * 1024 * 1024, // 100 MB hard ceiling
+          maxBodyLength: 100 * 1024 * 1024,
+        });
+        return Buffer.from(response.data);
+      }
+
       // Users
       async listUsers(params) {
         return this.request('GET', '/users.json', null, params);
